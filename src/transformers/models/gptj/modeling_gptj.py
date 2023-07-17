@@ -561,6 +561,7 @@ class GPTJModel(GPTJPreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        beam_idx_cache: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -687,6 +688,7 @@ class GPTJModel(GPTJPreTrainedModel):
             else:
                 outputs = block(
                     hidden_states=hidden_states,
+                    beam_idx_cache=beam_idx_cache,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -784,7 +786,7 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, beam_idx=None, past_key_values=None, inputs_embeds=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)
         # only last token for inputs_ids if past is defined in kwargs
         if past_key_values:
@@ -811,6 +813,7 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
         model_inputs.update(
             {
                 "past_key_values": past_key_values,
+                "beam_idx_cache": kwargs.get("beam_idx_cache"),
                 "use_cache": kwargs.get("use_cache"),
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
@@ -837,6 +840,7 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        beam_idx_cache: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -858,6 +862,7 @@ class GPTJForCausalLM(GPTJPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            beam_idx_cache=beam_idx_cache,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,

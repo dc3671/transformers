@@ -1606,6 +1606,7 @@ class GenerationMixin:
                 beam_scorer,
                 logits_processor=logits_processor,
                 stopping_criteria=stopping_criteria,
+                max_length=generation_config.max_length,
                 pad_token_id=generation_config.pad_token_id,
                 eos_token_id=generation_config.eos_token_id,
                 output_scores=generation_config.output_scores,
@@ -2886,6 +2887,12 @@ class GenerationMixin:
         beam_scores = beam_scores.view((batch_size * num_beams,))
 
         this_peer_finished = False  # used by synced_gpus only
+
+        max_out_length = max_length - cur_len
+        input_length = cur_len
+        index_cache_1 = torch.zeros((max_out_length, batch_size * num_beams), dtype=torch.int32, device=input_ids.device)
+        index_cache_2 = torch.zeros((max_out_length, batch_size * num_beams), dtype=torch.int32, device=input_ids.device)
+
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -2896,6 +2903,16 @@ class GenerationMixin:
                 # did all peers finish? the reduced sum will be 0.0 then
                 if this_peer_finished_flag.item() == 0.0:
                     break
+
+            step = cur_len - input_length
+            if step % 2 == 0:
+                in_beam_idx_cache = index_cache_1
+                out_beam_idx_cache = index_cache_2
+            else:
+                in_beam_idx_cache = index_cache_2
+                out_beam_idx_cache = index_cache_1
+
+            model_kwargs["beam_idx_cache"] = in_beam_idx_cache
 
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -2966,13 +2983,18 @@ class GenerationMixin:
             beam_next_tokens = beam_outputs["next_beam_tokens"]
             beam_idx = beam_outputs["next_beam_indices"]
 
+            #TODO: remove this after custom process
+            beam_idx = beam_idx.to(torch.int32)
+
+            out_beam_idx_cache = torch.ops.torch_ipex.update_beam_indices_for_cache(in_beam_idx_cache, out_beam_idx_cache, beam_idx, max_out_length, step, num_beams, batch_size)
+
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 
             model_kwargs = self._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
-            if model_kwargs["past_key_values"] is not None:
-                model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+            # if model_kwargs["past_key_values"] is not None:
+            #     model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
 
             if return_dict_in_generate and output_scores:
                 beam_indices = tuple((beam_indices[beam_idx[i]] + (beam_idx[i],) for i in range(len(beam_indices))))
