@@ -97,8 +97,11 @@ class LlamaRotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
+        # print(f"dim {dim}, max_position_embeddings {max_position_embeddings}, base {base}")
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # print(f"inv_freq {inv_freq}")
 
     @property
     def sin_cached(self):
@@ -205,6 +208,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class LlamaMLP(nn.Module):
+    _layer_id = 0
+    _iteration = 0
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -214,6 +219,8 @@ class LlamaMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
+        self._layer_id = LlamaMLP._layer_id
+        LlamaMLP._layer_id += 1
 
     def forward(self, x):
         if self.config.pretraining_tp > 1:
@@ -233,7 +240,25 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+            gate_proj = self.gate_proj(x)
+            if x.device.index == 3:
+                torch.save(gate_proj, f"gate_proj.i{LlamaMLP._iteration}.l{self._layer_id}.pt")
+            up_proj = self.up_proj(x)
+            if x.device.index == 3:
+                torch.save(up_proj, f"up_proj.i{LlamaMLP._iteration}.l{self._layer_id}.pt")
+            act = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            if x.device.index == 3:
+                torch.save(act, f"act.i{LlamaMLP._iteration}.l{self._layer_id}.pt")
+                torch.save(self.down_proj.weight, f"down_proj_w.i{LlamaMLP._iteration}.l{self._layer_id}.pt")
+            down_proj = self.down_proj(act)
+            # down_proj = torch.matmul(act, self.down_proj.weight.transpose(1, 0))
+            # if hasattr(self.down_proj, "mp_group"):
+            #     if x.device.index == 3:
+            #         torch.save(down_proj, f"down_proj_r.i{LlamaMLP._iteration}.l{self._layer_id}.pt")
+            #     from deepspeed import comm as dist
+            #     dist.inference_all_reduce(down_proj, group=self.down_proj.mp_group)
+            if x.device.index == 3:
+                torch.save(down_proj, f"down_proj.i{LlamaMLP._iteration}.l{self._layer_id}.pt")
 
         return down_proj
 
@@ -252,6 +277,8 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
+    _layer_id = 0
+    _iteration = 0
 
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__()
@@ -285,6 +312,9 @@ class LlamaAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias)
         self._init_rope()
+
+        self._layer_id = LlamaAttention._layer_id
+        LlamaAttention._layer_id += 1
 
     def _init_rope(self):
         if self.config.rope_scaling is None:
@@ -633,13 +663,25 @@ class LlamaSdpaAttention(LlamaAttention):
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        if hidden_states.device.index == 3:
+            torch.save(query_states, f"q_proj.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
+            torch.save(key_states, f"k_proj.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
+            torch.save(value_states, f"v_proj.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        if hidden_states.device.index == 3:
+            torch.save(position_ids, f"position_ids.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
+            torch.save(self.rotary_emb.inv_freq, f"inv_freq.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
 
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if hidden_states.device.index == 3:
+            torch.save(query_states, f"q_rot.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
+            torch.save(key_states, f"k_rot.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
+            torch.save(cos, f"cos.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
+            torch.save(sin, f"sin.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
 
         past_key_value = getattr(self, "past_key_value", past_key_value)
 
@@ -669,11 +711,15 @@ class LlamaSdpaAttention(LlamaAttention):
             attn_mask=causal_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
         )
+        if hidden_states.device.index == 3:
+            torch.save(attn_output, f"attn_output.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
 
         attn_output = self.o_proj(attn_output)
+        if hidden_states.device.index == 3:
+            torch.save(attn_output, f"o_proj.i{LlamaAttention._iteration}.l{self._layer_id}.pt")
 
         return attn_output, None, past_key_value
 
@@ -686,6 +732,9 @@ LLAMA_ATTENTION_CLASSES = {
 
 
 class LlamaDecoderLayer(nn.Module):
+    _layer_id = 0
+    _iteration = 0
+
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -695,6 +744,9 @@ class LlamaDecoderLayer(nn.Module):
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self._layer_id = LlamaDecoderLayer._layer_id
+        LlamaDecoderLayer._layer_id += 1
 
     def forward(
         self,
@@ -742,12 +794,20 @@ class LlamaDecoderLayer(nn.Module):
             **kwargs,
         )
         hidden_states = residual + hidden_states
+        if hidden_states.device.index == 3:
+            torch.save(hidden_states, f"o_proj_res.i{LlamaDecoderLayer._iteration}.l{self._layer_id}.pt")
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if hidden_states.device.index == 3:
+            torch.save(hidden_states, f"post_norm.i{LlamaDecoderLayer._iteration}.l{self._layer_id}.pt")
         hidden_states = self.mlp(hidden_states)
+        if hidden_states.device.index == 3:
+            torch.save(hidden_states, f"mlp.i{LlamaDecoderLayer._iteration}.l{self._layer_id}.pt")
         hidden_states = residual + hidden_states
+        if hidden_states.device.index == 3:
+            torch.save(hidden_states, f"mlp_res.i{LlamaDecoderLayer._iteration}.l{self._layer_id}.pt")
 
         outputs = (hidden_states,)
 
@@ -988,42 +1048,45 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        with torch.xpu.compute_eng(torch.xpu.XPUComputeEng.ONEDNN):
+            for decoder_layer in self.layers:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
 
-        for decoder_layer in self.layers:
-            if output_hidden_states:
-                all_hidden_states += (hidden_states,)
+                if self.gradient_checkpointing and self.training:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
 
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                )
+                hidden_states = layer_outputs[0]
 
-            hidden_states = layer_outputs[0]
+                if use_cache:
+                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
-            if use_cache:
-                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
 
         hidden_states = self.norm(hidden_states)
+        LlamaDecoderLayer._iteration += 1
+        LlamaAttention._iteration += 1
+        LlamaMLP._iteration += 1
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
